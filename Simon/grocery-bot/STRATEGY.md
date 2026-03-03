@@ -41,52 +41,66 @@
 
 ---
 
-## Optimization Techniques (v2)
+## Current Decision Priorities (v4)
+
+```
+0. Endgame scavenge — if <45 rounds left and order can't complete
+1. Drop-off — on drop-off with useful items → deliver
+S. Stuck recovery — inventory full + nothing useful → go to drop-off
+2. Full inventory — navigate to drop-off
+3. Adjacent ACTIVE item → pick up (NEVER preview items here)
+4. TSP route — optimal multi-stop for active items
+   Chain items only on LAST trip (active_picks < slots_free)
+4.5. Fill spare slots with preview items before delivering
+     Only when active fully collected + spare slots + detour ≤ 8 rounds
+     Items stay in inventory after drop_off, become useful when preview activates
+5. Deliver — go to drop-off with partial inventory
+6. Preview pre-pick — ONLY when active order fully handled
+7. Wait
+```
+
+---
+
+## Optimization Techniques
 
 ### 1. TSP Route Planning
-**Problem**: Greedy nearest-item picks suboptimal sequences (e.g., picks a nearby item then backtracks past a closer second item).
+**Problem**: Greedy nearest-item picks suboptimal sequences.
 
-**Solution**: For each set of items to pick up, enumerate all (item, pickup_tile) combinations and evaluate every permutation. Pick the route with minimum total distance: `pos → tile₁ → tile₂ → ... → drop_off`.
+**Solution**: Enumerate all (item, pickup_tile) combinations and evaluate every permutation. Pick the route with minimum total distance: `pos → tile₁ → tile₂ → ... → drop_off`.
 
 - Uses `bfs_distance_map()` for exact distance from current position
 - Manhattan distance for intermediate legs (fast approximation)
 - Caps at 6 items (6! = 720 permutations) — always fast enough
 - Re-plans every round (stateless) — naturally adapts as items get picked up
 
-### 2. Drop-Off Chain Exploitation
+### 2. Drop-Off Chain Exploitation (Conservative)
 **Problem**: Spare inventory slots wasted on final delivery trip.
 
-**Solution**: When heading to drop-off with the last active-order items, fill spare slots with preview-order items.
+**Solution**: On the LAST pickup trip only (when `active_picks < slots_free`), fill spare slots with preview items that chain-deliver on drop-off.
 
-- Calculate: `spare = max_inventory - carried - active_items_still_to_pick`
-- If spare > 0 and preview exists, merge preview types into the pickup target set
-- These chain-deliver automatically when active order completes
+**CRITICAL GUARD**: Chain items must ONLY be added when ALL active items fit in remaining inventory. Adding chain items before securing active items causes deadlocks (see Pitfalls).
 
-### 3. Opportunistic Path Detours
-**Problem**: Bot walks past useful preview items without picking them up.
+### 2b. Pre-Delivery Preview Fill (v4)
+**Problem**: After collecting the last active item (e.g., 4th item of a 4-item order via adjacent pickup), the bot has 1 item in inventory with 2 empty slots but heads straight to drop-off. Those empty slots are wasted.
 
-**Solution**: When navigating to any target, check if preview-order items have pickup tiles on or near the BFS path.
+**Solution**: Priority 4.5 — before delivering, check for preview items within a detour budget (≤8 extra rounds). Pick them up to fill inventory. After drop_off, the active items are delivered but preview items stay in inventory. When the preview order activates, those items are immediately useful — saving a full trip.
 
-- **0-step detour** (pickup tile on path): Only costs 1 extra round (the pick_up action). Always worth it.
-- **1-step detour** (1 tile off path): Costs ~3 rounds. Worth it on longer paths (>6 steps).
-- Applied when navigating to items AND to drop-off.
+**Impact**: The v3 replay had 7 single-item return trips (9 rounds each = 63 rounds). With preview fill, these become 2-3 item trips.
 
-### 4. Forward-Looking Tile Selection
-**Problem**: Choosing the nearest pickup tile may point away from the next destination, adding backtracking.
+### 3. Forward-Looking Tile Selection
+**Problem**: Choosing the nearest pickup tile may point away from the next destination.
 
-**Solution**: Score each pickup tile as `distance(pos → tile) + distance(tile → next_dest)` and pick the minimum.
+**Solution**: Score each pickup tile as `distance(pos → tile) + distance(tile → next_dest)` and pick the minimum. Applied in preview pre-picks (priority 6).
 
-- `next_dest` = drop-off when delivering, or next item in route
-- Biggest impact on preview pre-picks (priority 7) where the next stop is often drop-off
+### 4. Endgame Scavenge Mode
+**Problem**: With <45 rounds left, can't complete a full order.
 
-### 5. Endgame Scavenge Mode
-**Problem**: With <45 rounds left, starting a 4-item order that can't be completed wastes the order bonus AND the remaining rounds.
+**Solution**: Switch to rapid single-item deliveries (+1 each) instead of chasing +5 bonus.
 
-**Solution**: When `rounds_remaining < 45` and estimated completion exceeds remaining rounds, switch to rapid single-item deliveries.
-
-- Grab nearest item matching active order → deliver immediately
-- Scores +1 per item instead of gambling on +5 bonus
-- Trigger threshold: 45 rounds (enough for ~4-5 single-item runs)
+### 5. Path Detours (SUPERSEDED by Priority 4.5)
+Previously disabled due to deadlocks (picking preview items before active items secured).
+Now replaced by Priority 4.5 which is safe: only triggers when active order is fully collected,
+and uses a detour budget to avoid excessive wandering.
 
 ---
 
@@ -113,15 +127,15 @@
 - **Walkway aisles**: x=1,4,8
 - **Horizontal corridors**: y=1, y=5, y=7
 
-### Round-Trip Analysis (Easy)
-- Average item pickup from spawn area: ~12-15 steps
-- Drop-off round trip (center map → drop-off → center): ~16-20 steps
-- Optimal 3-item order: ~25 rounds (3 pickups + 1 delivery trip)
-- With TSP routing: saves 3-5 rounds per order vs greedy
-
 ---
 
 ## Known Pitfalls
+
+### Preview Item Deadlock (CRITICAL — fixed in v3)
+- **Cause**: Bot picks preview/chain items before securing all active items. Inventory fills with items that don't match active order → permanent deadlock.
+- **Example**: Active needs yogurt, bot picks butter+cheese (preview) first → full inventory → can never pick yogurt → 100+ rounds wasted.
+- **Fix**: Priority 3 (adjacent pickup) ONLY checks active items. Chain items only added in Priority 4 TSP when `active_picks < slots_free`.
+- **Safety net**: Stuck recovery sends bot to drop-off when inventory full + nothing useful.
 
 ### Desync
 - If WebSocket response arrives >2s late, server treats round as `wait` but queues our late response.
@@ -132,16 +146,14 @@
 ### Shelf Tiles ≠ Wall Tiles
 - Item positions are NOT in `grid.walls`. They're separate non-walkable tiles.
 - Must exclude them explicitly in `build_walkable_set()`.
-- Forgetting this causes BFS to route through shelves → bot gets stuck.
 
 ### Silent Action Failures
-- Invalid actions become `wait` with no error. Easy to miss.
+- Invalid actions become `wait` with no error.
 - Common causes: picking up when not adjacent, dropping off when not on drop-off tile.
 
 ### Collision Deadlocks (Multi-Bot)
 - Two bots in a 1-wide aisle can permanently block each other.
 - Current mitigation: treat other bots as blocked tiles, fallback to unblocked BFS if no path.
-- Better: corridor-sharing protocol with yielding behavior.
 
 ---
 
@@ -149,4 +161,21 @@
 
 | Date       | Map  | Score | Orders | Notes |
 |------------|------|-------|--------|-------|
-| 2026-03-03 | Easy | 30    | 3      | Desync at R105 wasted 192 rounds |
+| 2026-03-03 | Easy | 30    | 3      | v1 greedy. Desync at R105 wasted 192 rounds |
+| 2026-03-03 | Easy | 46    | 5      | v2 with TSP+chain. Chain bug caused deadlock at R190 (110 rounds wasted) |
+| 2026-03-03 | Easy | 82    | 9      | v3 fixed chain logic. 37 items, 17 trips, avg 10.3 rounds/trip |
+
+## v3 Replay Analysis (Score 82)
+
+- 300 rounds, 9 completed orders (10th incomplete), 37 items delivered
+- **1-item return trips were the #1 bottleneck**: 7 of 17 trips carried only 1 item (9 rounds each)
+- Root cause: after adjacent pickup of last active item, `still_needed` = {} → chain logic skipped → priority 5 delivered immediately
+- Best trips: 8 rounds for 3 items (0.38 eff). Worst: 16 rounds for 3 items on trip 1
+- 3-item orders completed in 14 rounds (fast). 4-item orders took 32-39 rounds (slow due to 2 trips)
+- Score/round: 0.273. Target 142 needs 0.473 (73% improvement)
+
+## Next Improvements to Try
+- Tune detour budget (currently 8) based on actual map distances
+- Smarter delivery batching (deliver 2 items if 3rd is far away)
+- Multi-bot coordination for Medium/Hard/Expert maps
+- Profile which item clusters are fastest round-trips from drop-off

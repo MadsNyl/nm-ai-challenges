@@ -1,12 +1,22 @@
 """
 Order fulfillment strategy — item targeting, task assignment, delivery logic.
 
-Optimizations over naive greedy approach:
-  1. TSP route planning — optimal multi-stop pickup routes (permutation search)
-  2. Drop-off chain exploitation — fill spare slots with preview items on final trip
-  3. Opportunistic path detours — grab preview items on/near the current path
-  4. Forward-looking pickup tile selection — choose tiles that minimize total trip
-  5. Endgame scavenge mode — rapid single-item deliveries when order can't complete
+Decision priorities (per bot, per round):
+  0. Endgame scavenge — rapid single-item deliveries when order can't complete
+  1. Drop-off — deliver if on drop-off with useful items
+  S. Stuck recovery — if inventory full + nothing useful, go to drop-off
+  2. Full inventory — navigate to drop-off
+  3. Adjacent active item — pick up (ONLY active order items, never preview)
+  4. TSP route — optimal multi-stop pickup for active items
+     Chain items (preview) only added on LAST trip when active fits with room to spare
+  5. Deliver — go to drop-off with partial inventory
+  6. Preview pre-pick — only when active order fully handled (forward-looking tile selection)
+
+Key lessons learned:
+  - NEVER pick preview/chain items before all active items are secured
+  - Adjacent pickup must ONLY target active order items (priority 3)
+  - Detours disabled — were filling inventory with useless preview items
+  - Stuck recovery prevents permanent deadlock from stale inventory
 
 Multi-bot flow (Medium/Hard/Expert):
   - Same core logic but with item assignment to avoid duplicate targeting
@@ -111,43 +121,48 @@ def _decide_bot(
     if pos == drop_off and has_useful > 0:
         return {"bot": bot_id, "action": "drop_off"}
 
-    # --- Priority 2: Chain exploitation — plan extra pickups for spare slots ---
-    chain_items = {}
-    if still_needed and preview_needed:
-        active_picks_left = sum(still_needed.values())
-        spare_slots = MAX_INVENTORY - len(inventory) - active_picks_left
-        if spare_slots > 0:
-            for item_type, count in preview_needed.items():
-                if spare_slots <= 0:
-                    break
-                take = min(count, spare_slots)
-                chain_items[item_type] = take
-                spare_slots -= take
+    # --- Stuck recovery: inventory full, nothing useful, but order needs items ---
+    # This prevents permanent deadlock from stale inventory items
+    if len(inventory) >= MAX_INVENTORY and has_useful == 0 and still_needed:
+        # Go to drop-off and try anyway — drop_off delivers whatever matches
+        if pos == drop_off:
+            return {"bot": bot_id, "action": "drop_off"}
+        return _navigate(bot_id, pos, drop_off, walkable, other_bots)
 
-    # --- Priority 3: Inventory full with useful items → deliver ---
+    # --- Priority 2: Inventory full with useful items → deliver ---
     if len(inventory) >= MAX_INVENTORY and has_useful > 0:
-        return _navigate_with_detour(
-            bot_id, pos, drop_off, walkable, other_bots,
-            items, preview_needed, inventory, claimed_item_ids,
-        )
+        return _navigate(bot_id, pos, drop_off, walkable, other_bots)
 
-    # --- Priority 4: Adjacent to needed item (active + chain) → pick up ---
-    pickup_types = dict(still_needed)
-    for t, c in chain_items.items():
-        pickup_types[t] = pickup_types.get(t, 0) + c
-
-    if pickup_types and len(inventory) < MAX_INVENTORY:
+    # --- Priority 3: Adjacent to needed ACTIVE item → pick up ---
+    # ONLY active order items here — never chain/preview items
+    if still_needed and len(inventory) < MAX_INVENTORY:
         for item in items:
             if item["id"] in claimed_item_ids:
                 continue
-            if item["type"] not in pickup_types or pickup_types[item["type"]] <= 0:
+            if item["type"] not in still_needed or still_needed[item["type"]] <= 0:
                 continue
             item_pos = tuple(item["position"])
             if _manhattan(pos, item_pos) == 1:
                 claimed_item_ids.add(item["id"])
                 return {"bot": bot_id, "action": "pick_up", "item_id": item["id"]}
 
-    # --- Priority 5: Plan optimal pickup route (TSP) with chain items ---
+    # --- Priority 4: Plan optimal pickup route for ACTIVE items (TSP) ---
+    # Chain items only added when this is the LAST pickup trip
+    # (all remaining active items fit in available slots)
+    pickup_types = dict(still_needed)
+    active_picks = sum(still_needed.values())
+    slots_free = MAX_INVENTORY - len(inventory)
+
+    # Only add chain items when all active items fit with room to spare
+    if active_picks > 0 and active_picks < slots_free and preview_needed:
+        spare = slots_free - active_picks
+        for item_type, count in preview_needed.items():
+            if spare <= 0:
+                break
+            take = min(count, spare)
+            pickup_types[item_type] = pickup_types.get(item_type, 0) + take
+            spare -= take
+
     if pickup_types and len(inventory) < MAX_INVENTORY:
         route_action = _plan_pickup_route(
             bot_id, pos, items, pickup_types, drop_off,
@@ -157,15 +172,50 @@ def _decide_bot(
         if route_action:
             return route_action
 
-    # --- Priority 6: Deliver what we have ---
-    if has_useful > 0:
-        return _navigate_with_detour(
-            bot_id, pos, drop_off, walkable, other_bots,
-            items, preview_needed, inventory, claimed_item_ids,
-        )
+    # --- Priority 4.5: Fill spare slots with preview items BEFORE delivering ---
+    # When all active items are collected but inventory has room, grab preview
+    # items on the way to drop-off. These stay in inventory after drop_off
+    # (only active-order items are delivered) and become useful when the
+    # preview order activates — saving a full trip later.
+    if has_useful > 0 and not still_needed and len(inventory) < MAX_INVENTORY and preview_needed:
+        # Check for adjacent preview item first
+        for item in items:
+            if item["id"] in claimed_item_ids:
+                continue
+            if item["type"] not in preview_needed or preview_needed[item["type"]] <= 0:
+                continue
+            item_pos = tuple(item["position"])
+            if _manhattan(pos, item_pos) == 1:
+                claimed_item_ids.add(item["id"])
+                return {"bot": bot_id, "action": "pick_up", "item_id": item["id"]}
 
-    # --- Priority 7: Pre-pick preview order items (forward-looking) ---
-    if preview_needed and len(inventory) < MAX_INVENTORY:
+        # Find nearest preview item within a detour budget
+        # Budget: only detour if the extra cost is worth it vs a separate trip later
+        dist_map = bfs_distance_map(pos, walkable, other_bots)
+        dist_to_dropoff = dist_map.get(drop_off, 99)
+        max_detour = 8  # rounds of detour we'll accept to fill a slot
+
+        target = _find_item_with_lookahead(
+            pos, items, preview_needed, claimed_item_ids, walkable, other_bots, drop_off,
+        )
+        if target:
+            item, pickup_pos = target
+            d_to_item = dist_map.get(pickup_pos, 99)
+            d_item_to_drop = _manhattan(pickup_pos, drop_off)
+            detour_cost = d_to_item + 1 + d_item_to_drop - dist_to_dropoff  # +1 for pickup action
+            if detour_cost <= max_detour:
+                claimed_item_ids.add(item["id"])
+                if pos == pickup_pos:
+                    return {"bot": bot_id, "action": "pick_up", "item_id": item["id"]}
+                return _navigate(bot_id, pos, pickup_pos, walkable, other_bots)
+
+    # --- Priority 5: Deliver what we have ---
+    if has_useful > 0:
+        return _navigate(bot_id, pos, drop_off, walkable, other_bots)
+
+    # --- Priority 6: Pre-pick preview order items (forward-looking) ---
+    # Only when active order is fully handled (nothing more to pick or carry)
+    if preview_needed and len(inventory) < MAX_INVENTORY and not still_needed:
         # Adjacent check first
         for item in items:
             if item["id"] in claimed_item_ids:
@@ -209,8 +259,9 @@ def _plan_pickup_route(
     """
     slots_available = MAX_INVENTORY - len(inventory)
 
-    # Collect candidate (item, pickup_tiles) for each needed type
+    # Collect candidate (item, pickup_tiles) for each needed type, sorted by distance
     candidates_by_type = {}
+    dist_from_pos = bfs_distance_map(pos, walkable, other_bots)
     for item in items:
         if item["id"] in claimed_item_ids:
             continue
@@ -222,6 +273,12 @@ def _plan_pickup_route(
         if not tiles:
             continue
         candidates_by_type.setdefault(itype, []).append((item, tiles))
+
+    # Sort candidates by nearest pickup tile distance so truncation keeps closest
+    for itype in candidates_by_type:
+        candidates_by_type[itype].sort(
+            key=lambda c: min((dist_from_pos.get(t, 999) for t in c[1]), default=999)
+        )
 
     if not candidates_by_type:
         return None
@@ -243,9 +300,7 @@ def _plan_pickup_route(
     if not selections:
         return None
 
-    # BFS distance map from current position for efficient lookups
-    dist_from_pos = bfs_distance_map(pos, walkable, other_bots)
-
+    # dist_from_pos already computed above for candidate sorting
     best_route = None
     best_cost = float("inf")
 
@@ -267,14 +322,6 @@ def _plan_pickup_route(
 
     if pos == first_tile:
         return {"bot": bot_id, "action": "pick_up", "item_id": first_item["id"]}
-
-    # Check for detour opportunity on the way
-    detour = _check_path_detour(
-        bot_id, pos, first_tile, walkable, other_bots, items,
-        preview_needed, inventory, claimed_item_ids,
-    )
-    if detour:
-        return detour
 
     return _navigate(bot_id, pos, first_tile, walkable, other_bots)
 
@@ -351,100 +398,13 @@ def _evaluate_route_cost(perm, dist_from_start, drop_off):
 
 
 # ---------------------------------------------------------------------------
-# Path Detour — grab preview items on or near the current path
+# Path Detour — grab preview items on the current path (conservative)
 # ---------------------------------------------------------------------------
-
-def _check_path_detour(
-    bot_id, pos, target, walkable, other_bots, items,
-    preview_needed, inventory, claimed_item_ids,
-):
-    """
-    Check if any preview item can be grabbed with minimal detour on the way to target.
-    Returns a pick_up or navigate action for a 0-cost detour, otherwise None.
-    """
-    if not preview_needed or len(inventory) >= MAX_INVENTORY:
-        return None
-
-    path = bfs(pos, target, walkable, other_bots)
-    if not path or len(path) < 3:
-        return None
-
-    # Tiles on the path (excluding start and end)
-    path_set = set(path[1:-1])
-
-    # Check for items adjacent from a path tile — 0-cost detour
-    for item in items:
-        if item["id"] in claimed_item_ids:
-            continue
-        if item["type"] not in preview_needed or preview_needed[item["type"]] <= 0:
-            continue
-        item_pos = tuple(item["position"])
-
-        # Already adjacent? Pick up now
-        if _manhattan(pos, item_pos) == 1:
-            claimed_item_ids.add(item["id"])
-            return {"bot": bot_id, "action": "pick_up", "item_id": item["id"]}
-
-        # Check if any pickup tile is on our path
-        pickup_tiles = adjacent_walkable(item_pos, walkable)
-        for tile in pickup_tiles:
-            if tile in path_set:
-                # Navigate toward this pickup tile — we'll pick up when adjacent
-                claimed_item_ids.add(item["id"])
-                return _navigate(bot_id, pos, tile, walkable, other_bots)
-
-    # Check for 1-step off-path detours (only on longer paths)
-    if len(path) > 6:
-        for item in items:
-            if item["id"] in claimed_item_ids:
-                continue
-            if item["type"] not in preview_needed or preview_needed[item["type"]] <= 0:
-                continue
-            item_pos = tuple(item["position"])
-            pickup_tiles = adjacent_walkable(item_pos, walkable)
-            for tile in pickup_tiles:
-                for path_tile in path_set:
-                    if _manhattan(tile, path_tile) == 1:
-                        claimed_item_ids.add(item["id"])
-                        return _navigate(bot_id, pos, tile, walkable, other_bots)
-
-    return None
-
-
-def _navigate_with_detour(
-    bot_id, pos, target, walkable, other_bots,
-    items, preview_needed, inventory, claimed_item_ids,
-):
-    """Navigate to target, checking for detour opportunities along the way."""
-    if preview_needed and len(inventory) < MAX_INVENTORY:
-        # Check if adjacent to any preview item right now
-        for item in items:
-            if item["id"] in claimed_item_ids:
-                continue
-            if item["type"] not in preview_needed or preview_needed[item["type"]] <= 0:
-                continue
-            item_pos = tuple(item["position"])
-            if _manhattan(pos, item_pos) == 1:
-                claimed_item_ids.add(item["id"])
-                return {"bot": bot_id, "action": "pick_up", "item_id": item["id"]}
-
-        # Check for on-path detours
-        path = bfs(pos, target, walkable, other_bots)
-        if path and len(path) >= 4:
-            path_set = set(path[1:-1])
-            for item in items:
-                if item["id"] in claimed_item_ids:
-                    continue
-                if item["type"] not in preview_needed or preview_needed[item["type"]] <= 0:
-                    continue
-                item_pos = tuple(item["position"])
-                pickup_tiles = adjacent_walkable(item_pos, walkable)
-                for tile in pickup_tiles:
-                    if tile in path_set:
-                        # Detour to grab this item
-                        return _navigate(bot_id, pos, tile, walkable, other_bots)
-
-    return _navigate(bot_id, pos, target, walkable, other_bots)
+# Detours are DISABLED for now. The aggressive detour logic was picking up
+# preview items that filled inventory slots needed for active order items,
+# causing deadlocks. Detours should only be re-enabled with strict guards:
+# - Only detour when ALL active items are already in inventory
+# - Only detour for 0-cost on-path items (not 1-step off-path)
 
 
 # ---------------------------------------------------------------------------

@@ -90,4 +90,16 @@ claude mcp add --transport http grocery-bot https://mcp-docs.ainm.no/mcp
 
 | Date       | Score | Orders | Notes |
 |------------|-------|--------|-------|
-| 2026-03-03 | 30    | 3      | Desync at R105 wasted 192 rounds |
+| 2026-03-03 | 30    | 3      | v1 greedy. Desync at R105 wasted 192 rounds |
+| 2026-03-03 | 46    | 5      | v2 TSP+chain. Chain bug deadlocked at R190 (110 rounds wasted) |
+| 2026-03-03 | 82    | 9      | v3 fixed chain. 37 items, 0 wasted rounds |
+
+## Strategy Notes
+
+See `grocery-bot/STRATEGY.md` for detailed strategy reference.
+
+**Critical lesson**: NEVER pick preview/chain items before all active items are secured.
+Adjacent pickup (priority 3) must ONLY target active order items. Chain items only on last trip.
+
+**v4 change**: Added priority 4.5 — fill spare inventory slots with preview items before delivering.
+When active order is fully collected but inventory has room, grab nearby preview items (within 8-round detour budget). They stay in inventory after drop_off and become useful when preview activates. Also sort TSP candidates by distance so closest shelves are preferred.
