@@ -19,19 +19,11 @@ from strategy import decide
 REPLAY_DIR = os.path.join(os.path.dirname(__file__), "replays")
 
 
-MOVE_DELTAS = {
-    "move_up": (0, -1), "move_down": (0, 1),
-    "move_left": (-1, 0), "move_right": (1, 0),
-}
-
 
 async def play(ws_url: str):
     frames = []
     game_result = None
     difficulty = None
-    # Desync detection: track what we expect each bot's position to be
-    expected_positions = {}  # bot_id -> (x, y) or None
-    desync_count = 0
 
     async with websockets.connect(ws_url) as ws:
         async for message in ws:
@@ -43,31 +35,11 @@ async def play(ws_url: str):
                 print(f"  Rounds: {data['rounds_used']}")
                 print(f"  Items delivered: {data['items_delivered']}")
                 print(f"  Orders completed: {data['orders_completed']}")
-                if desync_count:
-                    print(f"  Desyncs detected: {desync_count}")
                 game_result = data
                 break
 
             if data["type"] == "game_state":
-                # --- Desync detection ---
-                # Check if bots are where we expected them to be
-                desynced = False
-                for bot in data["bots"]:
-                    bid = bot["id"]
-                    actual = tuple(bot["position"])
-                    exp = expected_positions.get(bid)
-                    if exp is not None and exp != actual:
-                        desynced = True
-                        desync_count += 1
-                        print(f"  !! DESYNC R{data['round']}: B{bid} expected {exp} got {actual} — sending wait to re-sync")
-                        break
-
-                if desynced:
-                    # Send wait for all bots to let server catch up
-                    actions = [{"bot": b["id"], "action": "wait"} for b in data["bots"]]
-                    expected_positions.clear()
-                else:
-                    actions = decide(data)
+                actions = decide(data)
 
                 if difficulty is None:
                     difficulty = data.get("difficulty", "unknown")
@@ -76,17 +48,6 @@ async def play(ws_url: str):
                 r = data["round"]
                 if r % 25 == 0 or r < 3:
                     _log_round(data, actions)
-
-                # Record expected positions for next round
-                for bot, act in zip(data["bots"], actions):
-                    pos = tuple(bot["position"])
-                    if act["action"] in MOVE_DELTAS:
-                        dx, dy = MOVE_DELTAS[act["action"]]
-                        expected_positions[bot["id"]] = (pos[0] + dx, pos[1] + dy)
-                    elif act["action"] in ("pick_up", "drop_off", "wait"):
-                        expected_positions[bot["id"]] = pos
-                    else:
-                        expected_positions[bot["id"]] = None
 
                 frames.append({"state": data, "actions": actions})
 
