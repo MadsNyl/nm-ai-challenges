@@ -93,6 +93,7 @@ claude mcp add --transport http grocery-bot https://mcp-docs.ainm.no/mcp
 | 2026-03-03 | 30    | 3      | v1 greedy. Desync at R105 wasted 192 rounds |
 | 2026-03-03 | 46    | 5      | v2 TSP+chain. Chain bug deadlocked at R190 (110 rounds wasted) |
 | 2026-03-03 | 82    | 9      | v3 fixed chain. 37 items, 0 wasted rounds |
+| 2026-03-03 | 108   | 12     | v4 preview-fill. 48 items delivered |
 
 ## Strategy Notes
 
@@ -103,3 +104,5 @@ Adjacent pickup (priority 3) must ONLY target active order items. Chain items on
 
 **v4 change**: Added priority 4.5 — fill spare inventory slots with preview items before delivering.
 When active order is fully collected but inventory has room, grab nearby preview items (within 8-round detour budget). They stay in inventory after drop_off and become useful when preview activates. Also sort TSP candidates by distance so closest shelves are preferred.
+
+**v5 change**: Opportunity cost bias in TSP item selection. When multiple items of the same type exist, prefer items far from drop-off (harder to get on future trips). Items near drop-off are cheap to grab anytime. `OPPORTUNITY_COST_ALPHA = 0.3`.

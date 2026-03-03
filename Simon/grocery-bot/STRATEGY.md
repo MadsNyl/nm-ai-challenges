@@ -87,17 +87,32 @@ S. Stuck recovery — inventory full + nothing useful → go to drop-off
 
 **Impact**: The v3 replay had 7 single-item return trips (9 rounds each = 63 rounds). With preview fill, these become 2-3 item trips.
 
-### 3. Forward-Looking Tile Selection
+### 3. Opportunity Cost Item Selection (v5)
+**Problem**: When multiple items of the same type exist (e.g., two butter shelves), the TSP planner picks whichever minimizes the current trip. But items near the drop-off are cheap to grab on *any* future trip, while items far away are expensive. Grabbing a "cheap" item now wastes the chance to grab a "hard" item while you're already nearby.
+
+**Solution**: Add an opportunity cost bias to the TSP route cost function. Each item's shelf distance from drop-off is used as a bonus — items far from drop-off get a cost reduction, making them preferred when trip costs are similar.
+
+```
+adjusted_cost = trip_cost - α × Σ(manhattan(item_shelf, drop_off))
+```
+
+- `α = 0.3` — small enough not to override obvious distance wins, large enough to break ties
+- On easy map, shelf distances range ~3–15 from drop-off, so bias is 0.9–4.5 per item
+- Effect: when two items have similar pickup cost, prefer the one that's harder to reach from drop-off
+
+**Example**: Bot needs butter. Butter_A is 3 steps from drop-off, Butter_B is 10 steps. Both are ~equal distance from bot. Without bias, either is chosen. With bias, Butter_B is preferred (saving ~14 rounds if Butter_A is needed on a later trip).
+
+### 4. Forward-Looking Tile Selection
 **Problem**: Choosing the nearest pickup tile may point away from the next destination.
 
 **Solution**: Score each pickup tile as `distance(pos → tile) + distance(tile → next_dest)` and pick the minimum. Applied in preview pre-picks (priority 6).
 
-### 4. Endgame Scavenge Mode
+### 5. Endgame Scavenge Mode
 **Problem**: With <45 rounds left, can't complete a full order.
 
 **Solution**: Switch to rapid single-item deliveries (+1 each) instead of chasing +5 bonus.
 
-### 5. Path Detours (SUPERSEDED by Priority 4.5)
+### 6. Path Detours (SUPERSEDED by Priority 4.5)
 Previously disabled due to deadlocks (picking preview items before active items secured).
 Now replaced by Priority 4.5 which is safe: only triggers when active order is fully collected,
 and uses a detour budget to avoid excessive wandering.
@@ -164,6 +179,7 @@ and uses a detour budget to avoid excessive wandering.
 | 2026-03-03 | Easy | 30    | 3      | v1 greedy. Desync at R105 wasted 192 rounds |
 | 2026-03-03 | Easy | 46    | 5      | v2 with TSP+chain. Chain bug caused deadlock at R190 (110 rounds wasted) |
 | 2026-03-03 | Easy | 82    | 9      | v3 fixed chain logic. 37 items, 17 trips, avg 10.3 rounds/trip |
+| 2026-03-03 | Easy | 108   | 12     | v4 preview-fill. 48 items, eliminated 1-item trip waste |
 
 ## v3 Replay Analysis (Score 82)
 
@@ -175,6 +191,7 @@ and uses a detour budget to avoid excessive wandering.
 - Score/round: 0.273. Target 142 needs 0.473 (73% improvement)
 
 ## Next Improvements to Try
+- Tune `OPPORTUNITY_COST_ALPHA` (currently 0.3) — test 0.2–0.5 range
 - Tune detour budget (currently 8) based on actual map distances
 - Smarter delivery batching (deliver 2 items if 3rd is far away)
 - Multi-bot coordination for Medium/Hard/Expert maps

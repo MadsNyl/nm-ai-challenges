@@ -36,6 +36,7 @@ from pathfinding import (
 
 MAX_INVENTORY = 3
 ENDGAME_THRESHOLD = 45  # rounds remaining to trigger scavenge mode
+OPPORTUNITY_COST_ALPHA = 0.3  # bias toward items far from drop-off (harder to get later)
 
 
 def decide(state: dict) -> list[dict]:
@@ -370,6 +371,10 @@ def _evaluate_route_cost(perm, dist_from_start, drop_off):
     """
     Evaluate total cost for route: start → tile₁ → tile₂ → ... → drop_off.
     Uses BFS dist map for first leg, Manhattan for subsequent legs.
+
+    Includes opportunity cost bias: items far from drop-off are harder to
+    pick up on future trips, so we prefer grabbing them now by subtracting
+    a bonus proportional to their distance from drop-off.
     """
     total = 0
     stops = list(perm)
@@ -393,6 +398,12 @@ def _evaluate_route_cost(perm, dist_from_start, drop_off):
 
     # Last leg: last tile → drop_off
     total += _manhattan(prev_tile, drop_off)
+
+    # Opportunity cost bias: prefer items far from drop-off (hard to get later)
+    # Items near drop-off are cheap on any future trip, so defer them.
+    for item, tile in stops:
+        item_pos = tuple(item["position"])
+        total -= OPPORTUNITY_COST_ALPHA * _manhattan(item_pos, drop_off)
 
     return total
 
