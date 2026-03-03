@@ -3,7 +3,7 @@
 **Team Guttakrutt** — Competition project for NM i AI (Norwegian Championship in AI) 2026.
 Main competition launches March 19 with CV, NLP, and ML tasks.
 
-**Repo**: https://github.com/SimonKvalheim/guttakrutt-NMiAI
+**Repo**: https://github.com/MadsNyl/nm-ai-challenges (subfolder: `Simon/`)
 
 ## Project Structure
 
